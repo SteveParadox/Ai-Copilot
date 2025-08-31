@@ -2,19 +2,75 @@ import asyncio
 import json
 import os
 import uuid
-from typing import Optional
+from typing import Optional, List
 
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
 
-from pipeline import pipeline, cache_get
+from pipeline import pipeline, cache_get, cache_set, client
+
 
 # ===================== CONFIG =====================
 SERVICE_NAME = os.getenv("SERVICE_NAME", "NLP Service")
 SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.0")
 
 app = FastAPI(title=SERVICE_NAME, version=SERVICE_VERSION)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],   # Restrict to frontend URL in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ===================== WS CONNECTION MANAGER =====================
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+        print(f"[WS] Client connected. Total: {len(self.active_connections)}")
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+            print(f"[WS] Client disconnected. Total: {len(self.active_connections)}")
+
+    async def broadcast(self, message: str):
+        """Broadcast message to all connected clients"""
+        to_remove = []
+        for connection in self.active_connections:
+            try:
+                await connection.send_text(message)
+            except Exception as e:
+                print(f"[WS] Broadcast error: {e}")
+                to_remove.append(connection)
+        # cleanup dead connections
+        for conn in to_remove:
+            self.disconnect(conn)
+
+
+manager = ConnectionManager()
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            # keep connection alive (ignore client messages)
+            try:
+                await asyncio.wait_for(websocket.receive_text(), timeout=60)
+            except asyncio.TimeoutError:
+                # send ping to keep alive
+                await websocket.send_text("[WS] heartbeat")
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
 
 
 # ===================== MODELS =====================
@@ -32,8 +88,8 @@ async def health():
 
 
 @app.post("/answer")
-async def answer_stream(req: AnswerRequest, x_request_id: Optional[str] = Header(None)):
-    """ Streaming NLP answer endpoint """
+async def answer_json(req: AnswerRequest, x_request_id: Optional[str] = Header(None)):
+    """ Non-streaming NLP answer endpoint (returns pure JSON) """
     request_id = x_request_id or str(uuid.uuid4())
     prompt = req.question.strip()
 
@@ -49,34 +105,29 @@ async def answer_stream(req: AnswerRequest, x_request_id: Optional[str] = Header
         print(f"[NLP:{request_id}] Returning cached response")
         return JSONResponse({"cached": True, "answer": cached})
 
-    # ---- Run pipeline ----
-    queue: asyncio.Queue = asyncio.Queue()
-    loop = asyncio.get_running_loop()
+    # ---- Run pipeline in non-streaming mode ----
+    try:
+        messages = [
+            {"role": "system", "content": f"You are an AI assistant for interviews. Provide answers in a {req.style} manner."},
+            {"role": "user", "content": prompt + (f" The company is {req.company}." if req.company else "")},
+        ]
 
-    # Kick off background streaming
-    asyncio.create_task(
-        pipeline.run_stream(prompt, req.style, req.company, queue, loop, cache_key)
-    )
+        resp = client.chat.completions.create(
+            model=pipeline.model,
+            messages=messages,
+            temperature=0.4,
+            max_tokens=800,
+        )
 
-    async def event_generator():
-        try:
-            while True:
-                item = await queue.get()
-                if item is None:
-                    break
+        answer = resp.choices[0].message.content.strip()
+        cache_set(cache_key, answer)
 
-                # Error event
-                if isinstance(item, dict) and item.get("error"):
-                    yield f"event: error\ndata: {json.dumps({'message': item['error']})}\n\n"
-                    print(f"[NLP:{request_id}] Error: {item['error']}")
-                    break
+        # Broadcast to WS clients
+        await manager.broadcast(answer)
+        print(f"[NLP:{request_id}] Completed JSON answer")
 
-                # Normal streaming delta
-                yield f"data: {json.dumps({'delta': item['delta']})}\n\n"
+        return JSONResponse({"answer": answer, "cached": False})
 
-            yield f"event: done\ndata: {json.dumps({'status': 'done'})}\n\n"
-            print(f"[NLP:{request_id}] Completed stream")
-        except Exception as e:
-            print(f"[NLP:{request_id}] Exception in generator: {e}")
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    except Exception as e:
+        print(f"[NLP:{request_id}] ERROR: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

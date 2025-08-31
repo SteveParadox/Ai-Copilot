@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>ASR + NLP Client</title>
+  <style>
+    body { font-family: sans-serif; margin: 2rem; }
+    #transcript, #answer {
+      border: 1px solid #ccc;
+      padding: 1rem;
+      min-height: 80px;
+      margin-top: 1rem;
+      white-space: pre-wrap;
+      background: #f9f9f9;
+    }
+  </style>
+</head>
+<body>
+  <h2>🎙 ASR + NLP Demo</h2>
+  <button id="startBtn">Start Recording</button>
+  <button id="stopBtn" disabled>Stop Recording</button>
+
+  <h3>📝 Transcript</h3>
+  <div id="transcript"></div>
+
+  <h3>🤖 NLP Answer</h3>
+  <div id="answer"></div>
+
+<script>
+let ws, audioCtx, processor, source, stream;
+let fullTranscript = "";
+
+const transcriptEl = document.getElementById("transcript");
+const answerEl = document.getElementById("answer");
+const startBtn = document.getElementById("startBtn");
+const stopBtn = document.getElementById("stopBtn");
+
+startBtn.onclick = async () => {
+  fullTranscript = "";
+  transcriptEl.innerText = "";
+  answerEl.innerText = "";
+
+  // ✅ Check your ASR backend route
+  ws = new WebSocket("ws://localhost:8000/ws/stream");
+
+  ws.onmessage = (event) => {
+    try {
+      const data = JSON.parse(event.data);
+      if (data.text) {
+        fullTranscript += " " + data.text;
+      } else {
+        fullTranscript += " " + event.data;
+      }
+    } catch {
+      fullTranscript += " " + event.data;
+    }
+    transcriptEl.innerText = fullTranscript.trim();
+  };
+
+  stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+  source = audioCtx.createMediaStreamSource(stream);
+
+  processor = audioCtx.createScriptProcessor(4096, 1, 1);
+  processor.onaudioprocess = (e) => {
+    if (ws.readyState === WebSocket.OPEN) {
+      const input = e.inputBuffer.getChannelData(0);
+      const pcm16 = new Int16Array(input.length);
+      for (let i = 0; i < input.length; i++) {
+        let s = Math.max(-1, Math.min(1, input[i]));
+        pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      }
+      ws.send(pcm16.buffer);
+    }
+  };
+
+  source.connect(processor);
+  processor.connect(audioCtx.destination);
+
+  startBtn.disabled = true;
+  stopBtn.disabled = false;
+};
+
+stopBtn.onclick = () => {
+  if (processor) processor.disconnect();
+  if (source) source.disconnect();
+  if (audioCtx) audioCtx.close();
+  if (ws) ws.close();
+  if (stream) stream.getTracks().forEach(t => t.stop());
+
+  // ✅ NLP service endpoint must match your FastAPI route
+  if (fullTranscript.trim().length > 0) {
+    fetch("http://localhost:8001/answer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question: fullTranscript.trim() })
+    })
+    .then(res => res.json())
+    .then(data => {
+      answerEl.innerText = data.answer || "⚠️ No answer received";
+    })
+    .catch(err => {
+      answerEl.innerText = "❌ NLP request failed: " + err.message;
+    });
+  }
+
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+};
+</script>
+</body>
+</html>

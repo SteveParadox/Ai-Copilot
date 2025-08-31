@@ -6,6 +6,9 @@ import asyncio
 import logging
 from openai import OpenAI
 
+from dotenv import load_dotenv
+load_dotenv()
+
 # ---------------- config ----------------
 log = logging.getLogger("nlp_pipeline")
 logging.basicConfig(level=logging.INFO)
@@ -46,14 +49,49 @@ class NLPPipeline:
     def __init__(self):
         self.model = OPENAI_MODEL
 
+    def _build_messages(self, prompt: str, style: str = "Concise", company: str = ""):
+        """
+        Internal helper to standardize messages.
+        """
+        return [
+            {
+                "role": "system",
+                "content": f"You are an AI assistant for interviews. Provide answers in a {style} manner.",
+            },
+            {
+                "role": "user",
+                "content": prompt + (f" The company is {company}." if company else ""),
+            },
+        ]
+
+    def non_stream_answer(self, prompt: str, style: str = "Concise", company: str = "") -> str:
+        """
+        Synchronous non-streaming answer (full JSON response).
+        """
+        cache_key = f"{prompt}|{style}|{company}"
+        cached = _cache_get(cache_key)
+        if cached:
+            log.info(f"Cache hit for {cache_key}")
+            return cached
+
+        messages = self._build_messages(prompt, style, company)
+        log.info(f"Calling OpenAI {self.model} (stream=False)")
+        resp = client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=OPENAI_TEMPERATURE,
+            max_tokens=OPENAI_MAX_TOKENS,
+        )
+
+        answer = resp.choices[0].message.content.strip()
+        _cache_set(cache_key, answer)
+        return answer
+
     def stream_answer(self, prompt: str, style: str = "Concise", company: str = ""):
         """
         Generator that yields answer deltas from OpenAI streaming.
         """
-        messages = [
-            {"role": "system", "content": f"You are an AI assistant for interviews. Provide answers in a {style} manner."},
-            {"role": "user", "content": prompt + (f" The company is {company}." if company else "")},
-        ]
+        messages = self._build_messages(prompt, style, company)
         log.info(f"Calling OpenAI {self.model} (stream=True)")
         resp = client.chat.completions.create(
             model=self.model,
@@ -70,33 +108,6 @@ class NLPPipeline:
                 delta = ""
             if delta:
                 yield delta
-
-    async def run_stream(
-        self,
-        prompt: str,
-        style: str,
-        company: str,
-        queue: asyncio.Queue,
-        loop,
-        cache_key: str,
-    ):
-        """
-        Runs OpenAI stream in a background thread and pushes deltas to asyncio queue.
-        """
-        def _worker():
-            full = []
-            try:
-                for delta in self.stream_answer(prompt, style, company):
-                    asyncio.run_coroutine_threadsafe(queue.put({"delta": delta}), loop)
-                    full.append(delta)
-                _cache_set(cache_key, "".join(full).strip())
-            except Exception as e:
-                log.exception("OpenAI streaming error")
-                asyncio.run_coroutine_threadsafe(queue.put({"error": str(e)}), loop)
-            finally:
-                asyncio.run_coroutine_threadsafe(queue.put(None), loop)
-
-        threading.Thread(target=_worker, daemon=True).start()
 
 
 pipeline = NLPPipeline()
