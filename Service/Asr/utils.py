@@ -1,6 +1,7 @@
 # utils.py
+import re
 import numpy as np
-from collections import Counter
+from collections import Counter, defaultdict
 import logging
 from typing import List, Optional, Iterable, Generator, Hashable, Any
 
@@ -12,49 +13,208 @@ logging.basicConfig(
 )
 
 # ===================== MAJORITY VOTE =====================
-def majority_vote(items: List[Hashable]) -> Optional[Hashable]:
+
+_normalize_re = re.compile(r"[^\w\s]")
+MIN_CHARS = 6
+junk = []
+def _normalize_text(s: str) -> str:
+    """Lower, remove punctuation, collapse whitespace for voting/compare."""
+    if not s:
+        return ""
+    s = s.lower().strip()
+    s = _normalize_re.sub("", s)
+    s = " ".join(s.split())
+    return s
+
+# ===================== MAJORITY VOTE =====================
+
+def majority_vote(
+    items: List[str],
+    weights: Optional[List[float]] = None,
+    min_conf: float = 0.0,
+    tie_strategy: str = "first"
+) -> Optional[str]:
     """
-    Return the most common element in a list.
-    Tie-breaker: first encountered among the most common.
+    Robust majority vote (weighted or unweighted).
+
     Args:
-        items: list of hashable items
+        items: list of candidate strings
+        weights: optional weights/confidences, defaults to uniform
+        min_conf: discard votes with weight < min_conf
+        tie_strategy: tie-breaking rule
+            - "first": first-seen among tied
+            - "highest_weight": item with highest single vote weight
+            - "random": random choice among tied
+
     Returns:
-        most common item or None if list is empty
+        str | None: normalized winning candidate
     """
     if not items:
-        log.debug("Empty list provided to majority_vote.")
+        return None
+    if weights and len(weights) != len(items):
+        raise ValueError("Items and weights must have same length")
+
+    weights = weights or [1.0] * len(items)
+
+    scores = defaultdict(float)
+    item_max_weight = defaultdict(float)
+
+    for item, w in zip(items, weights):
+        norm_item = _normalize_text(item)
+        if not norm_item or w < min_conf:
+            continue
+        scores[norm_item] += w
+        item_max_weight[norm_item] = max(item_max_weight[norm_item], w)
+
+    if not scores:
         return None
 
-    counter = Counter(items)
-    most_common_items = counter.most_common()
-    max_count = most_common_items[0][1]
-    tied = [item for item, count in most_common_items if count == max_count]
-    if len(tied) > 1:
-        log.info(f"Tie detected among items {tied}, returning first encountered.")
-    return tied[0]
+    max_score = max(scores.values())
+    candidates = [it for it, sc in scores.items() if sc == max_score]
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    if tie_strategy == "highest_weight":
+        return max(candidates, key=lambda it: item_max_weight[it])
+    elif tie_strategy == "first":
+        for item in items:
+            if _normalize_text(item) in candidates:
+                return _normalize_text(item)
+    elif tie_strategy == "random":
+        return np.random.choice(candidates)
+
+    return candidates[0]  # default fallback
+
 
 # ===================== WEIGHTED VOTE =====================
-def weighted_vote(items: List[Hashable], weights: List[float]) -> Hashable:
+
+def weighted_vote(items: List[str], weights: List[float]) -> Optional[str]:
     """
-    Weighted majority vote.
+    Weighted majority vote with text normalization and stability improvements.
+    
     Args:
-        items: list of elements
+        items: list of strings
         weights: list of corresponding weights (floats)
     Returns:
-        element with highest weighted sum
-    Raises:
-        ValueError if items and weights have different lengths
+        Most likely item (string) with highest weighted score, or None
     """
+    if not items or not weights:
+        return None
     if len(items) != len(weights):
         raise ValueError("Items and weights must have the same length")
 
-    vote_scores: dict[Hashable, float] = {}
-    for item, weight in zip(items, weights):
-        vote_scores[item] = vote_scores.get(item, 0.0) + weight
+    vote_scores: dict[str, float] = {}
 
-    winner = max(vote_scores.items(), key=lambda x: x[1])[0]
-    log.debug(f"Weighted votes: {vote_scores}, winner: {winner}")
+    for item, weight in zip(items, weights):
+        # Normalize + trim whitespace + lowercase
+        norm_item = _normalize_text(item).strip().lower()
+
+        # Skip empties or too-short garbage
+        if not norm_item or len(norm_item) < 2:
+            continue
+
+        # Collapse runs of duplicate tokens (fixes "asus asus asus")
+        deduped = " ".join(dict.fromkeys(norm_item.split()))
+
+        vote_scores[deduped] = vote_scores.get(deduped, 0.0) + weight
+
+    if not vote_scores:
+        return None
+
+    # Pick the winner with highest score
+    winner, score = max(vote_scores.items(), key=lambda x: x[1])
+
+    # Debug info for traceability
+    log.debug(f"Weighted votes: {vote_scores}, winner: {winner} (score={score:.2f})")
+
     return winner
+
+
+import logging
+
+log = logging.getLogger(__name__)
+
+def weighted_majority(
+    items: List[str],
+    weights: List[float],
+    min_conf: float = 0.0,
+    tie_strategy: str = "highest_weight"
+) -> Optional[str]:
+    """
+    Weighted majority vote with normalization and better tie-breaking.
+    
+    Args:
+        items (List[str]): list of candidate strings
+        weights (List[float]): corresponding weights/confidences
+        min_conf (float): discard votes with weight < min_conf
+        tie_strategy (str): how to break ties
+            - "highest_weight": winner is item with highest single weight
+            - "first": winner is first-seen among tied
+            - "random": choose randomly among tied
+    
+    Returns:
+        str | None: normalized winner
+    """
+    if not items or not weights or len(items) != len(weights):
+        return None
+
+    scores = defaultdict(float)
+    item_max_weight = defaultdict(float)
+
+    for item, w in zip(items, weights):
+        norm_item = _normalize_text(item)
+        if not norm_item or w < min_conf:
+            continue
+        scores[norm_item] += w
+        item_max_weight[norm_item] = max(item_max_weight[norm_item], w)
+
+    if not scores:
+        return None
+
+    # Find top score(s)
+    max_score = max(scores.values())
+    candidates = [it for it, sc in scores.items() if sc == max_score]
+
+    if len(candidates) == 1:
+        winner = candidates[0]
+    else:
+        if tie_strategy == "highest_weight":
+            winner = max(candidates, key=lambda it: item_max_weight[it])
+        elif tie_strategy == "first":
+            for it, _ in zip(items, weights):
+                if _normalize_text(it) in candidates:
+                    winner = _normalize_text(it)
+                    break
+        elif tie_strategy == "random":
+            winner = np.random.choice(candidates)
+        else:
+            winner = candidates[0]
+
+    log.debug(f"Weighted scores={dict(scores)}, candidates={candidates}, winner={winner}")
+    return winner
+
+def weighted_majority_vote(transcripts: list[str], weights: list[float] = None) -> str:
+    """Improved weighted majority vote with fallback."""
+    if not transcripts:
+        return ""
+    
+    from collections import defaultdict
+    scores = defaultdict(float)
+    weights = weights or [1.0] * len(transcripts)
+    
+    for t, w in zip(transcripts, weights):
+        scores[t.strip()] += w
+    
+    # Pick best by score
+    best, best_score = max(scores.items(), key=lambda x: x[1])
+    
+    # If score is low, fallback to last transcript
+    if best_score < 1.5:  # tweak threshold
+        return transcripts[-1]
+    
+    return best
+
 
 # ===================== ARRAY NORMALIZATION =====================
 def normalize_array(arr: np.ndarray, min_val: float = 0.0, max_val: float = 1.0) -> np.ndarray:
@@ -113,3 +273,11 @@ def chunk_list(lst: List[Any], chunk_size: int) -> Generator[List[Any], None, No
         raise ValueError("chunk_size must be a positive integer")
     for i in range(0, len(lst), chunk_size):
         yield lst[i:i + chunk_size]
+
+def dedup_text(text: str) -> str:
+    words = text.split()
+    cleaned = []
+    for w in words:
+        if not cleaned or w != cleaned[-1]:
+            cleaned.append(w)
+    return " ".join(cleaned)

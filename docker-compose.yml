@@ -1,20 +1,70 @@
-version: "3.8"
+version: "3.9"
+
 services:
-  asr:
-    build: ./asr_service
-    volumes: ['./models:/models']
+  # ------------------- NLP Service -------------------
+  nlp-service:
+    build:
+      context: ./nlp_service
+      dockerfile: Dockerfile
+    container_name: nlp_service
+    restart: always
     environment:
-      - WHISPER_MODEL=small
-    ports:
-      - "8000:8000"
-  nlp:
-    build: ./nlp_service
-    environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-    ports:
-      - "8001:8001"
-  # optional redis:
+      SERVICE_NAME: "NLP Service"
+      SERVICE_VERSION: "1.0"
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    command: >
+      uvicorn main:app
+      --host 0.0.0.0
+      --port 8000
+      --workers 2
+    depends_on:
+      - redis
+    env_file:
+      - .env
+
+  # ------------------- Redis Cache -------------------
   redis:
-    image: redis:7
+    image: redis:7-alpine
+    container_name: redis_cache
+    restart: always
     ports:
       - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  # ------------------- ASR Service -------------------
+  asr-api:
+    build:
+      context: ./asr_service
+      dockerfile: Dockerfile
+    container_name: asr_api
+    restart: always
+    environment:
+      WHISPER_MODEL: tiny
+      WHISPER_DEVICE: cuda
+      WHISPER_COMPUTE_TYPE: int8
+      BLOCK_SIZE: 1024
+    command: >
+      uvicorn api:app
+      --host 0.0.0.0
+      --port 8000
+      --workers 2
+
+  # ------------------- NGINX Reverse Proxy -------------------
+  nginx:
+    image: nginx:stable-alpine
+    container_name: api_gateway
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - asr-api
+      - nlp-service
+
+volumes:
+  redis_data:

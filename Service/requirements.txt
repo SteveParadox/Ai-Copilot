@@ -1,0 +1,5 @@
+faster-whisper==0.10.0
+numpy>=1.23.0
+sounddevice>=0.4.6
+pynput>=1.7.6
+python-dotenv>=1.0.0
