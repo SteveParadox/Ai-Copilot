@@ -922,4 +922,15 @@ if __name__ == "__main__":
     try:
         result = transcribe(test_audio)
         print(f"Result: {json.dumps(result.to_dict(), indent=2)}")
-    except Exception
+    except Exception as e:
+        print(f"Error: {e}")
+    
+    # Metrics
+    print("\n=== Metrics ===")
+    print(json.dumps(get_metrics(), indent=2))
+    
+    # Cleanup
+    print("\n=== Unloading Model ===")
+    unload_whisper()
+    print("Done")
+
