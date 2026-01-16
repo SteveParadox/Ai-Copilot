@@ -1,324 +1,477 @@
-"""
- speech preprocessing module
-- VAD (WebRTC VAD preferred, with energy-based fallback)
-- Spectral gating denoiser (uses STFT, noise estimated from non-speech frames)
-- Bandpass filtering, DC removal, normalization, trimming, noise gate
-- Configurable and thread-safe (no global state)
-
-Usage:
-    from production_preprocessing import Preprocessor
-    pre = Preprocessor(sample_rate=16000)
-    cleaned = pre.process(raw_audio)
-
-Notes:
-- Optional dependency: webrtcvad (`pip install webrtcvad`). If not installed a robust energy-based VAD is used.
-- This implementation tries to keep dependencies minimal (numpy, scipy).
-"""
-
-from typing import Optional, Tuple
-import numpy as np
-import logging
-from scipy.signal import butter, lfilter, stft, istft
-
-log = logging.getLogger("Preprocessing")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-# Try to import webrtcvad; fall back to energy-based VAD if unavailable
-try:
-    import webrtcvad  # type: ignore
-    _HAS_WEBRTC = True
-except Exception:
-    _HAS_WEBRTC = False
-
-
-class Preprocessor:
-    """ speech preprocessing pipeline.
-
-    Main features:
-      - to_float32, mono conversion
-      - DC offset removal
-      - optional bandpass filtering
-      - normalization to target dBFS
-      - VAD (WebRTC or energy-based)
-      - spectral gating denoising (noise estimated from non-speech frames)
-      - trimming and post-cleaning noise gate
-
-    Parameters
-    ----------
-    sample_rate: int
-        Audio sample rate (e.g. 16000)
-    lowcut, highcut: int
-        Bandpass filter cutoffs
-    vad_mode: int
-        WeRTC VAD mode (0-3) more aggressive -> 3 (only used if webrtc available)
-    denoise_method: str
-        'spectral_gating' (currently implemented)
-    n_fft, hop_length: int
-        STFT params for denoising
-    noise_frames: int
-        Number of non-speech frames to use to build noise profile
-    target_dBFS: float
-        Target loudness for normalization
-    """
-
-    def __init__(
-        self,
-        sample_rate: int = 16000,
-        lowcut: int = 80,
-        highcut: int = 8000,
-        vad_mode: int = 2,
-        denoise_method: str = "spectral_gating",
-        n_fft: int = 1024,
-        hop_length: int = 256,
-        noise_frames: int = 6,
-        target_dBFS: float = -20.0,
-    ) -> None:
-        self.sr = sample_rate
-        self.lowcut = lowcut
-        self.highcut = highcut
-        self.vad_mode = vad_mode
-        self.denoise_method = denoise_method
-        self.n_fft = n_fft
-        self.hop_length = hop_length
-        self.noise_frames = noise_frames
-        self.target_dBFS = target_dBFS
-
-        if _HAS_WEBRTC:
-            self._vad = webrtcvad.Vad()
-            self._vad.set_mode(max(0, min(3, vad_mode)))
-            log.info("WebRTC VAD available and enabled")
-        else:
-            self._vad = None
-            log.info("WebRTC VAD not available — using energy-based VAD fallback")
-
-    # ---------------- Basic conversions ----------------
-    def to_float32(self, audio: np.ndarray) -> np.ndarray:
-        if audio.dtype == np.float32:
-            return audio
-        if audio.dtype == np.int16:
-            return audio.astype(np.float32) / 32768.0
-        if audio.dtype == np.int32:
-            return audio.astype(np.float32) / 2147483648.0
-        log.debug(f"Casting audio from {audio.dtype} to float32")
-        return audio.astype(np.float32)
-
-    def prep_mono(self, audio: np.ndarray) -> np.ndarray:
-        audio = self.to_float32(audio)
-        if audio.ndim == 2:
-            if audio.shape[1] > 1:
-                audio = audio.mean(axis=1, dtype=np.float32)
-            else:
-                audio = audio[:, 0]
-        return audio
-
-    def remove_dc_offset(self, audio: np.ndarray) -> np.ndarray:
-        return audio - np.mean(audio)
-
-    def rms(self, audio: np.ndarray) -> float:
-        return float(np.sqrt(np.mean(audio ** 2) + 1e-12))
-
-    def normalize_audio(self, audio: np.ndarray, target_dBFS: Optional[float] = None) -> np.ndarray:
-        tgt = self.target_dBFS if target_dBFS is None else target_dBFS
-        audio = self.to_float32(audio)
-        rms_val = self.rms(audio)
-        if rms_val <= 0:
-            return audio
-        scalar = 10 ** (tgt / 20.0) / rms_val
-        audio = audio * scalar
-        audio = np.clip(audio, -1.0, 1.0)
-        return audio
-
-    # ---------------- Filters ----------------
-    def bandpass_filter(self, audio: np.ndarray, order: int = 5) -> np.ndarray:
-        nyq = 0.5 * self.sr
-        low = max(self.lowcut / nyq, 1e-5)
-        high = min(self.highcut / nyq, 0.99999)
-        if low >= high:
-            log.warning("Invalid bandpass range — skipping bandpass")
-            return audio
-        b, a = butter(order, [low, high], btype="band")
-        return lfilter(b, a, audio).astype(np.float32)
-
-    # ---------------- VAD ----------------
-    def frame_generator(self, audio: np.ndarray, frame_ms: int = 30) -> Tuple[np.ndarray, int]: # type: ignore
-        frame_len = int(self.sr * frame_ms / 1000)
-        num_frames = int(np.ceil(len(audio) / frame_len))
-        for i in range(num_frames):
-            start = i * frame_len
-            end = min(start + frame_len, len(audio))
-            frame = audio[start:end]
-            if len(frame) < frame_len:
-                # pad
-                frame = np.pad(frame, (0, frame_len - len(frame)), mode="constant")
-            yield frame, start
-
-    def is_speech_webrtc(self, frame: np.ndarray) -> bool:
-        # webrtcvad expects 16-bit PCM bytes at 8000/16000/32000/48000
-        if self._vad is None:
-            return False
-        pcm16 = (np.clip(frame, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
-        try:
-            return self._vad.is_speech(pcm16, sample_rate=self.sr)
-        except Exception:
-            return False
-
-    def energy_vad(self, frame: np.ndarray, thr: float) -> bool:
-        return self.rms(frame) > thr
-
-    def apply_vad(self, audio: np.ndarray, frame_ms: int = 30, energy_threshold: float = 0.01) -> np.ndarray:
-        """Return boolean mask of speech frames (per-sample mask)."""
-        audio = self.to_float32(audio)
-        mask = np.zeros_like(audio, dtype=bool)
-        for frame, start in self.frame_generator(audio, frame_ms=frame_ms):
-            use_speech = False
-            if _HAS_WEBRTC and self._vad is not None:
-                use_speech = self.is_speech_webrtc(frame)
-            else:
-                # energy threshold adapted by global RMS
-                use_speech = self.energy_vad(frame, thr=energy_threshold)
-            end = start + len(frame)
-            mask[start:end] = use_speech
-        return mask
-
-    # ---------------- Trimming & gating ----------------
-    def trim_silence(self, audio: np.ndarray, mask: Optional[np.ndarray] = None, padding_ms: int = 50) -> np.ndarray:
-        audio = self.to_float32(audio)
-        if mask is None:
-            # fallback: amplitude threshold
-            idx = np.where(np.abs(audio) > 0.01)[0]
-            if idx.size == 0:
-                return audio
-            return audio[idx[0] : idx[-1] + 1]
-        # mask -> find continuous speech region
-        idx = np.where(mask)[0]
-        if idx.size == 0:
-            return audio
-        pad = int(self.sr * padding_ms / 1000)
-        start = max(0, idx[0] - pad)
-        end = min(len(audio), idx[-1] + pad + 1)
-        return audio[start:end]
-
-    def apply_noise_gate(self, audio: np.ndarray, gate_threshold: float = 0.02) -> np.ndarray:
-        a = self.to_float32(audio)
-        a[np.abs(a) < gate_threshold] = 0.0
-        return a
-
-    # ---------------- Spectral gating denoiser ----------------
-    def _estimate_noise_spectrum(self, S_mag: np.ndarray, spec_mask: np.ndarray) -> np.ndarray:
-        """Estimate noise magnitude spectrum from frames where spec_mask==False (non-speech).
-        S_mag: (freq_bins, frames)
-        spec_mask: boolean array length frames (True=speech)
-        """
-        if spec_mask is None or np.all(spec_mask):
-            # no non-speech frames — estimate noise as the minimum across time
-            return np.min(S_mag, axis=1, keepdims=True)
-        nonspeech = ~spec_mask
-        if np.sum(nonspeech) < 1:
-            return np.min(S_mag, axis=1, keepdims=True)
-        return np.mean(S_mag[:, nonspeech], axis=1, keepdims=True)
-
-    def spectral_gating(self, audio: np.ndarray, mask: Optional[np.ndarray] = None) -> np.ndarray:
-        """Simple spectral gating denoiser.
-
-        Steps:
-          1. Compute STFT magnitude
-          2. Estimate noise spectrum from mask (non-speech frames) or from lowest-energy frames
-          3. Apply soft gain to reduce magnitude where magnitude <= noise * noise_reduction_factor
-          4. Reconstruct via ISTFT
-        """
-        if len(audio) < 2:
-            return audio
-
-        # STFT
-        f, t, Zxx = stft(audio, fs=self.sr, nperseg=self.n_fft, noverlap=self.n_fft - self.hop_length)
-        S = np.abs(Zxx)
-        phase = np.angle(Zxx)
-
-        # Build spec_mask per STFT frame from VAD mask (if provided)
-        spec_mask = None
-        if mask is not None:
-            # convert per-sample mask -> per-frame
-            frame_len = int(self.sr * (self.n_fft / self.sr))
-            # Use hop_length to align: number of frames should equal t.shape[0]
-            per_frame_mask = []
-            samples_per_frame = self.hop_length
-            for i in range(t.shape[0]):
-                start = i * samples_per_frame
-                end = min(start + samples_per_frame, len(mask))
-                if end <= start:
-                    per_frame_mask.append(False)
-                else:
-                    per_frame_mask.append(bool(np.mean(mask[start:end]) > 0.5))
-            spec_mask = np.array(per_frame_mask, dtype=bool)
-
-        noise_mag = self._estimate_noise_spectrum(S, spec_mask)
-
-        # Noise floor and gain
-        reduction_factor = 1.5  # how many times above noise we allow
-        gain = np.maximum(0.0, (S - noise_mag * reduction_factor) / (S + 1e-12))
-        # Smooth gain across frequency/time to prevent musical noise: simple median filter across time
-        # (keep implementation dependency-free)
-        # Apply gain
-        S_denoised = S * gain
-        Zxx_denoised = S_denoised * np.exp(1j * phase)
-
-        # ISTFT
-        _, xrec = istft(Zxx_denoised, fs=self.sr, nperseg=self.n_fft, noverlap=self.n_fft - self.hop_length)
-        xrec = xrec[: len(audio)]
-        # Avoid artifacts: normalize to original RMS
-        orig_rms = self.rms(audio)
-        rec_rms = self.rms(xrec) + 1e-12
-        if rec_rms > 0:
-            xrec = xrec * (orig_rms / rec_rms)
-        return xrec.astype(np.float32)
-
-    # ---------------- Full pipeline ----------------
-    def process(self, audio: np.ndarray) -> np.ndarray:
-        """Run the full preprocessing pipeline and return cleaned audio.
-
-        Steps:
-          - Mono & float32
-          - DC offset removal
-          - Bandpass filtering
-          - VAD to build speech mask
-          - Trim silence using VAD
-          - Estimate noise and apply spectral gating
-          - Post-gate trimming, noise gate, normalization
-        """
-        audio = self.prep_mono(audio)
-        if audio.size == 0:
-            return audio
-
-        audio = self.remove_dc_offset(audio)
-        audio = self.bandpass_filter(audio)
-
-        # VAD mask (per-sample boolean)
-        vad_mask = self.apply_vad(audio)
-
-        # Trim leading/trailing non-speech using VAD
-        audio = self.trim_silence(audio, mask=vad_mask)
-
-        # Denoise using spectral gating with noise estimated from non-speech frames
-        try:
-            if self.denoise_method == "spectral_gating":
-                audio = self.spectral_gating(audio, mask=vad_mask)
-        except Exception as e:
-            log.warning(f"Denoising failed: {e} — continuing without denoising")
-
-        # Post processing
-        audio = self.apply_noise_gate(audio, gate_threshold=0.005)
-        audio = self.normalize_audio(audio)
-
-        # Final trim with VAD again (in case denoising changed energy distribution)
-        vad_mask2 = self.apply_vad(audio)
-        audio = self.trim_silence(audio, mask=vad_mask2)
-
+log.warning(f"Denoising failed: {e}, continuing without denoising")
+                denoise_applied = False
+        
+        # Noise gate
+        audio = self.signal_processor.apply_noise_gate(
+            audio,
+            threshold=self.noise_gate_threshold,
+            sample_rate=self.sample_rate,
+        )
+        
+        # Normalize RMS
+        audio = self.signal_processor.normalize_rms(audio, self.target_dbfs)
+        
+        # Final trim (after denoising may have changed energy distribution)
+        trim_applied = False
+        if self.trim_enabled:
+            try:
+                vad_mask_final = self.vad.get_speech_mask(audio)
+                audio = self.signal_processor.trim_silence(
+                    audio,
+                    mask=vad_mask_final,
+                    padding_ms=self.padding_ms,
+                    sample_rate=self.sample_rate,
+                )
+                trim_applied = True
+            except Exception as e:
+                log.warning(f"Final trimming failed: {e}")
+        
         # Ensure float32
-        return self.to_float32(audio)
+        audio = to_float32(audio)
+        
+        # Final validation
+        if audio.size == 0:
+            log.warning("Preprocessing resulted in empty audio")
+            raise ValueError("Preprocessing produced empty audio")
+        
+        # Compute metrics
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        processed_length = len(audio)
+        processed_rms = compute_rms(audio)
+        
+        metrics = PreprocessingMetrics(
+            duration_ms=duration_ms,
+            original_length=original_length,
+            processed_length=processed_length,
+            original_rms=original_rms,
+            processed_rms=processed_rms,
+            vad_speech_ratio=speech_ratio,
+            denoise_applied=denoise_applied,
+            trim_applied=trim_applied,
+        )
+        
+        log.debug(
+            f"Preprocessing complete: {duration_ms:.1f}ms, "
+            f"length: {original_length} -> {processed_length}, "
+            f"speech_ratio: {speech_ratio:.2f}"
+        )
+        
+        if return_metrics:
+            return audio, metrics
+        return audio
+    
+    def process_batch(
+        self,
+        audio_list: list[np.ndarray],
+        return_metrics: bool = False,
+    ) -> list[np.ndarray] | list[Tuple[np.ndarray, PreprocessingMetrics]]:
+        """
+        Process multiple audio clips.
+        
+        Args:
+            audio_list: List of audio arrays
+            return_metrics: Whether to return metrics
+        
+        Returns:
+            List of preprocessed audio (and metrics if requested)
+        """
+        results = []
+        for i, audio in enumerate(audio_list):
+            try:
+                result = self.process(audio, return_metrics=return_metrics)
+                results.append(result)
+                log.debug(f"Batch item {i+1}/{len(audio_list)} processed")
+            except Exception as e:
+                log.error(f"Batch item {i+1} failed: {e}")
+                if return_metrics:
+                    results.append((np.array([]), None))
+                else:
+                    results.append(np.array([]))
+        
+        return results
+    
+    def get_config(self) -> Dict[str, Any]:
+        """Get current configuration."""
+        return {
+            "sample_rate": self.sample_rate,
+            "lowcut": self.lowcut,
+            "highcut": self.highcut,
+            "vad_method": self.vad.method.value,
+            "vad_mode": self.vad.mode,
+            "denoise_enabled": self.denoise_enabled,
+            "denoise_method": self.denoise_method,
+            "target_dbfs": self.target_dbfs,
+            "trim_enabled": self.trim_enabled,
+        }
 
 
-# ---------------- Convenience function for simple use ----------------
+# ============================================================================
+# Convenience Functions
+# ============================================================================
 
-def clean_audio(audio: np.ndarray, sample_rate: int = 16000) -> np.ndarray:
-    pre = Preprocessor(sample_rate=sample_rate)
-    return pre.process(audio)
+_default_preprocessor: Optional[Preprocessor] = None
+
+
+def clean_audio(
+    audio: np.ndarray,
+    sample_rate: int = PreprocessingConfig.DEFAULT_SAMPLE_RATE,
+    **kwargs
+) -> np.ndarray:
+    """
+    Convenience function for simple preprocessing.
+    
+    Args:
+        audio: Input audio
+        sample_rate: Sample rate
+        **kwargs: Additional arguments for Preprocessor
+    
+    Returns:
+        Preprocessed audio
+    
+    Examples:
+        >>> import numpy as np
+        >>> audio = np.random.randn(16000).astype(np.float32)
+        >>> cleaned = clean_audio(audio, sample_rate=16000)
+    """
+    global _default_preprocessor
+    
+    # Reuse preprocessor if sample rate matches
+    if _default_preprocessor is None or _default_preprocessor.sample_rate != sample_rate:
+        _default_preprocessor = Preprocessor(sample_rate=sample_rate, **kwargs)
+    
+    return _default_preprocessor.process(audio)
+
+
+def get_speech_segments(
+    audio: np.ndarray,
+    sample_rate: int = PreprocessingConfig.DEFAULT_SAMPLE_RATE,
+    min_duration_ms: int = 300,
+) -> list[Tuple[int, int]]:
+    """
+    Detect speech segments in audio.
+    
+    Args:
+        audio: Input audio
+        sample_rate: Sample rate
+        min_duration_ms: Minimum segment duration
+    
+    Returns:
+        List of (start_sample, end_sample) tuples
+    
+    Examples:
+        >>> audio = load_audio("speech.wav")
+        >>> segments = get_speech_segments(audio, sample_rate=16000)
+        >>> for start, end in segments:
+        ...     segment = audio[start:end]
+    """
+    vad = VoiceActivityDetector(sample_rate=sample_rate)
+    mask = vad.get_speech_mask(audio)
+    
+    # Find contiguous speech regions
+    segments = []
+    in_speech = False
+    start = 0
+    
+    min_samples = int(sample_rate * min_duration_ms / 1000)
+    
+    for i, is_speech in enumerate(mask):
+        if is_speech and not in_speech:
+            # Start of speech
+            start = i
+            in_speech = True
+        elif not is_speech and in_speech:
+            # End of speech
+            if i - start >= min_samples:
+                segments.append((start, i))
+            in_speech = False
+    
+    # Handle final segment
+    if in_speech and len(mask) - start >= min_samples:
+        segments.append((start, len(mask)))
+    
+    return segments
+
+
+# ============================================================================
+# Analysis & Diagnostics
+# ============================================================================
+
+@dataclass
+class AudioAnalysis:
+    """Comprehensive audio analysis results."""
+    duration_seconds: float
+    sample_rate: int
+    num_samples: int
+    rms: float
+    peak: float
+    dynamic_range_db: float
+    dc_offset: float
+    zero_crossings: int
+    speech_ratio: float
+    clipping_ratio: float
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "duration_seconds": round(self.duration_seconds, 3),
+            "sample_rate": self.sample_rate,
+            "num_samples": self.num_samples,
+            "rms": round(self.rms, 6),
+            "rms_dbfs": round(linear_to_db(self.rms), 2),
+            "peak": round(self.peak, 6),
+            "peak_dbfs": round(linear_to_db(self.peak), 2),
+            "dynamic_range_db": round(self.dynamic_range_db, 2),
+            "dc_offset": round(self.dc_offset, 6),
+            "zero_crossings": self.zero_crossings,
+            "speech_ratio": round(self.speech_ratio, 3),
+            "clipping_ratio": round(self.clipping_ratio, 4),
+        }
+
+
+def analyze_audio(
+    audio: np.ndarray,
+    sample_rate: int = PreprocessingConfig.DEFAULT_SAMPLE_RATE,
+    run_vad: bool = True,
+) -> AudioAnalysis:
+    """
+    Comprehensive audio analysis.
+    
+    Args:
+        audio: Input audio
+        sample_rate: Sample rate
+        run_vad: Whether to run VAD analysis
+    
+    Returns:
+        AudioAnalysis with detailed metrics
+    """
+    audio = to_float32(to_mono(audio))
+    
+    # Basic metrics
+    duration = len(audio) / sample_rate
+    rms = compute_rms(audio)
+    peak = float(np.max(np.abs(audio)))
+    
+    # Dynamic range
+    min_val = float(np.min(np.abs(audio[audio != 0]))) if np.any(audio != 0) else 1e-12
+    dynamic_range_db = linear_to_db(peak) - linear_to_db(min_val)
+    
+    # DC offset
+    dc_offset = float(np.mean(audio))
+    
+    # Zero crossings
+    zero_crossings = int(np.sum(np.diff(np.sign(audio)) != 0))
+    
+    # Speech ratio
+    speech_ratio = 0.0
+    if run_vad:
+        vad = VoiceActivityDetector(sample_rate=sample_rate)
+        mask = vad.get_speech_mask(audio)
+        speech_ratio = float(np.mean(mask))
+    
+    # Clipping detection
+    clipping_threshold = 0.99
+    clipping_ratio = float(np.mean(np.abs(audio) >= clipping_threshold))
+    
+    return AudioAnalysis(
+        duration_seconds=duration,
+        sample_rate=sample_rate,
+        num_samples=len(audio),
+        rms=rms,
+        peak=peak,
+        dynamic_range_db=dynamic_range_db,
+        dc_offset=dc_offset,
+        zero_crossings=zero_crossings,
+        speech_ratio=speech_ratio,
+        clipping_ratio=clipping_ratio,
+    )
+
+
+def compare_preprocessing(
+    audio: np.ndarray,
+    sample_rate: int = PreprocessingConfig.DEFAULT_SAMPLE_RATE,
+) -> Dict[str, AudioAnalysis]:
+    """
+    Compare audio before and after preprocessing.
+    
+    Args:
+        audio: Input audio
+        sample_rate: Sample rate
+    
+    Returns:
+        Dict with 'before' and 'after' AudioAnalysis
+    """
+    # Analyze original
+    before = analyze_audio(audio, sample_rate, run_vad=True)
+    
+    # Process
+    preprocessor = Preprocessor(sample_rate=sample_rate)
+    processed = preprocessor.process(audio)
+    
+    # Analyze processed
+    after = analyze_audio(processed, sample_rate, run_vad=True)
+    
+    return {
+        "before": before,
+        "after": after,
+    }
+
+
+# ============================================================================
+# Health Check
+# ============================================================================
+
+def get_health() -> Dict[str, Any]:
+    """Get preprocessing module health status."""
+    return {
+        "webrtc_available": _HAS_WEBRTC,
+        "default_sample_rate": PreprocessingConfig.DEFAULT_SAMPLE_RATE,
+        "denoise_enabled": PreprocessingConfig.DENOISE_ENABLED,
+        "vad_methods": ["webrtc", "energy"] if _HAS_WEBRTC else ["energy"],
+    }
+
+
+# ============================================================================
+# Testing & Examples
+# ============================================================================
+
+if __name__ == "__main__":
+    import json
+    
+    print("=" * 80)
+    print("AUDIO PREPROCESSING - COMPREHENSIVE DEMO")
+    print("=" * 80)
+    
+    # Generate test audio
+    print("\n1. Generating test audio...")
+    sample_rate = 16000
+    duration = 3.0
+    t = np.linspace(0, duration, int(sample_rate * duration))
+    
+    # Speech-like signal (modulated sine waves)
+    speech = np.sin(2 * np.pi * 200 * t) * (1 + 0.5 * np.sin(2 * np.pi * 3 * t))
+    
+    # Add noise
+    noise = np.random.randn(len(t)) * 0.1
+    audio = speech + noise
+    
+    # Add silence at beginning and end
+    silence_samples = int(0.5 * sample_rate)
+    audio = np.concatenate([
+        np.zeros(silence_samples),
+        audio,
+        np.zeros(silence_samples)
+    ])
+    
+    print(f"Test audio: {len(audio)/sample_rate:.1f}s @ {sample_rate}Hz")
+    
+    # ========================================================================
+    # 2. Audio Analysis
+    # ========================================================================
+    print("\n" + "=" * 80)
+    print("2. AUDIO ANALYSIS (BEFORE PREPROCESSING)")
+    print("=" * 80)
+    
+    analysis_before = analyze_audio(audio, sample_rate)
+    print(json.dumps(analysis_before.to_dict(), indent=2))
+    
+    # ========================================================================
+    # 3. Simple Preprocessing
+    # ========================================================================
+    print("\n" + "=" * 80)
+    print("3. SIMPLE PREPROCESSING")
+    print("=" * 80)
+    
+    cleaned = clean_audio(audio, sample_rate=sample_rate)
+    print(f"Original length: {len(audio)} samples")
+    print(f"Cleaned length: {len(cleaned)} samples")
+    print(f"Reduction: {100*(1-len(cleaned)/len(audio)):.1f}%")
+    
+    # ========================================================================
+    # 4. Advanced Preprocessing with Metrics
+    # ========================================================================
+    print("\n" + "=" * 80)
+    print("4. ADVANCED PREPROCESSING WITH METRICS")
+    print("=" * 80)
+    
+    preprocessor = Preprocessor(
+        sample_rate=sample_rate,
+        denoise_enabled=True,
+        trim_enabled=True,
+    )
+    
+    processed, metrics = preprocessor.process(audio, return_metrics=True)
+    print("\nMetrics:")
+    print(json.dumps(metrics.to_dict(), indent=2))
+    
+    # ========================================================================
+    # 5. Comparison
+    # ========================================================================
+    print("\n" + "=" * 80)
+    print("5. BEFORE/AFTER COMPARISON")
+    print("=" * 80)
+    
+    comparison = compare_preprocessing(audio, sample_rate)
+    
+    print("\nBEFORE:")
+    print(json.dumps(comparison["before"].to_dict(), indent=2))
+    
+    print("\nAFTER:")
+    print(json.dumps(comparison["after"].to_dict(), indent=2))
+    
+    # ========================================================================
+    # 6. Speech Segmentation
+    # ========================================================================
+    print("\n" + "=" * 80)
+    print("6. SPEECH SEGMENTATION")
+    print("=" * 80)
+    
+    segments = get_speech_segments(audio, sample_rate, min_duration_ms=300)
+    print(f"Found {len(segments)} speech segments:")
+    for i, (start, end) in enumerate(segments, 1):
+        duration_ms = (end - start) / sample_rate * 1000
+        print(f"  Segment {i}: {start}-{end} ({duration_ms:.0f}ms)")
+    
+    # ========================================================================
+    # 7. Batch Processing
+    # ========================================================================
+    print("\n" + "=" * 80)
+    print("7. BATCH PROCESSING")
+    print("=" * 80)
+    
+    # Create batch of audio clips
+    batch = [
+        audio,
+        audio[:len(audio)//2],  # Shorter clip
+        audio + np.random.randn(len(audio)) * 0.05,  # Noisier clip
+    ]
+    
+    results = preprocessor.process_batch(batch, return_metrics=True)
+    
+    for i, (processed_audio, metrics) in enumerate(results, 1):
+        print(f"\nBatch item {i}:")
+        print(f"  Duration: {metrics.duration_ms:.1f}ms")
+        print(f"  Length: {metrics.original_length} -> {metrics.processed_length}")
+        print(f"  Speech ratio: {metrics.vad_speech_ratio:.2f}")
+    
+    # ========================================================================
+    # 8. Configuration
+    # ========================================================================
+    print("\n" + "=" * 80)
+    print("8. PREPROCESSOR CONFIGURATION")
+    print("=" * 80)
+    
+    config = preprocessor.get_config()
+    print(json.dumps(config, indent=2))
+    
+    # ========================================================================
+    # 9. Health Check
+    # ========================================================================
+    print("\n" + "=" * 80)
+    print("9. HEALTH CHECK")
+    print("=" * 80)
+    
+    health = get_health()
+    print(json.dumps(health, indent=2))
+    
+    print("\n" + "=" * 80)
+    print("DEMO COMPLETE")
+    print("=" * 80)
