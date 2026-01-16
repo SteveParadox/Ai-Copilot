@@ -897,8 +897,8 @@ class Preprocessor:
             try:
                 audio = self.denoiser.denoise(audio, vad_mask)
                 denoise_applied = True
-            except Exception as e
-          log.warning(f"Denoising failed: {e}, continuing without denoising")
+            except Exception as e:
+                log.warning(f"Denoising failed: {e}, continuing without denoising")
                 denoise_applied = False
         
         # Noise gate
@@ -1375,3 +1375,4 @@ if __name__ == "__main__":
     print("\n" + "=" * 80)
     print("DEMO COMPLETE")
     print("=" * 80)
+
