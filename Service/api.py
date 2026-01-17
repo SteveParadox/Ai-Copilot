@@ -53,7 +53,7 @@ from Asr.model import (
     get_metrics as model_metrics,
     TranscriptionResult,
 )
-from Asr.preprocessing import (
+from Asr._preprocessing import (
     Preprocessor,
     get_health as preprocessing_health,
     analyze_audio,
@@ -917,3 +917,4 @@ if __name__ == "__main__":
         reload=os.getenv("DEBUG", "false").lower() == "true",
         log_level="info",
     )
+
